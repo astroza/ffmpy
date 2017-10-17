@@ -1,7 +1,8 @@
 import errno
 import shlex
 import subprocess
-
+import os
+import re
 
 __version__ = '0.2.2'
 
@@ -11,7 +12,8 @@ class FFmpeg(object):
     ffprobe).
     """
 
-    def __init__(self, executable='ffmpeg', global_options=None, inputs=None, outputs=None):
+    def __init__(self, executable='ffmpeg', global_options=None, inputs=None, outputs=None,
+                 update_size=2048):
         """Initialize FFmpeg command line wrapper.
 
         Compiles FFmpeg command line from passed arguments (executable path, options, inputs and
@@ -55,11 +57,30 @@ class FFmpeg(object):
 
         self.cmd = subprocess.list2cmdline(self._cmd)
         self.process = None
+        self.update_size = update_size
 
     def __repr__(self):
         return '<{0!r} {1!r}>'.format(self.__class__.__name__, self.cmd)
 
-    def run(self, input_data=None, stdin=None, stdout=None, stderr=None):
+    def start(self, input_data=None, stdin=None, stdout=None):
+        if input_data is not None or stdin is None:
+            stdin = subprocess.PIPE
+
+        try:
+            self.process = subprocess.Popen(
+                self._cmd,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=subprocess.PIPE
+            )
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                raise FFExecutableNotFoundError(
+                    "Executable '{0}' not found".format(self.executable))
+            else:
+                raise
+
+    def run(self, input_data=None, stdin=None, stdout=None, on_progress=None):
         """Execute FFmpeg command line.
 
         ``input_data`` can contain input for FFmpeg in case ``pipe`` protocol is used for input.
@@ -81,34 +102,79 @@ class FFmpeg(object):
         :param stdin: replace FFmpeg ``stdin`` (default is `None` which means `subprocess.PIPE`)
         :param stdout: redirect FFmpeg ``stdout`` there (default is `None` which means no
             redirection)
-        :param stderr: redirect FFmpeg ``stderr`` there (default is `None` which means no
-            redirection)
         :return: a 2-tuple containing ``stdout`` and ``stderr`` of the process
         :rtype: tuple
         :raise: `FFRuntimeError` in case FFmpeg command exits with a non-zero code;
             `FFExecutableNotFoundError` in case the executable path passed was not valid
         """
-        if input_data is not None or stdin is None:
-            stdin = subprocess.PIPE
+        self.start(input_data, stdin, stdout)
+        return [None, self.wait(on_progress)]
 
-        try:
-            self.process = subprocess.Popen(
-                self._cmd,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=stderr
-            )
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                raise FFExecutableNotFoundError("Executable '{0}' not found".format(self.executable))
-            else:
-                raise
+    def wait(self, on_progress=None, stderr_ring_size=30):
+        stderr_ring = []
+        is_running = True
+        stderr_fileno = self.process.stderr.fileno()
+        ff_state = FFstate()
+        while is_running:
+            latest_update = os.read(stderr_fileno, self.update_size)
+            if ff_state.consume(latest_update) and on_progress is not None:
+                on_progress(ff_state)
+            stderr_ring.append(latest_update)
+            if len(stderr_ring) > stderr_ring_size:
+                del stderr_ring[0]
+            is_running = self.process.poll() is None
 
-        out = self.process.communicate(input=input_data)
+        stderr_out = str.join("", stderr_ring)
         if self.process.returncode != 0:
-            raise FFRuntimeError(self.cmd, self.process.returncode, out[0], out[1])
+            raise FFRuntimeError(self.cmd, self.process.returncode, stderr_out)
 
-        return out
+        return stderr_out
+
+
+class FFstate:
+    def __init__(self):
+        self.frame = None
+        self.fps = None
+        self.size = None
+        self.time = None
+
+    def consume(self, update):
+        raw_update_dict = {}
+        for match in re.finditer(r"(?P<key>\S+)=\s*(?P<value>\S+)", update):
+            raw_update_dict[match.group("key")] = match.group("value")
+        updated = self.update_frame(raw_update_dict.get("frame")) + \
+            self.update_fps(raw_update_dict.get("fps")) + \
+            self.update_size(raw_update_dict.get("size") or raw_update_dict.get("Lsize", "")) + \
+            self.update_time(raw_update_dict.get("time", ""))
+        return updated > 0
+
+    def update_frame(self, raw_frame):
+        if raw_frame is not None:
+            self.frame = int(raw_frame)
+            return True
+        return False
+
+    def update_fps(self, fps_raw):
+        if fps_raw is not None:
+            self.fps = float(fps_raw)
+            return True
+        return False
+
+    def update_size(self, raw_size):
+        digits_match = re.match(r"(?P<size_in_kb>\d+)kB", raw_size)
+        if digits_match is not None:
+            self.size = int(digits_match.group("size_in_kb")) * 1000
+            return True
+        return False
+
+    def update_time(self, raw_time):
+        time_units_match = re.match(
+            r"(?P<hours>\d+):(?P<minutes>\d+):(?P<seconds>\d+.\d+)", raw_time)
+        if time_units_match is not None:
+            self.time = int(time_units_match.group("hours")) * 3600 + int(
+                time_units_match.group("minutes")) * 60 + float(time_units_match.group("seconds"))
+            return True
+        return False
 
 
 class FFprobe(FFmpeg):
@@ -146,16 +212,14 @@ class FFRuntimeError(Exception):
     ``cmd``, ``exit_code``, ``stdout``, ``stderr``.
     """
 
-    def __init__(self, cmd, exit_code, stdout, stderr):
+    def __init__(self, cmd, exit_code, stderr):
         self.cmd = cmd
         self.exit_code = exit_code
-        self.stdout = stdout
         self.stderr = stderr
 
-        message = "`{0}` exited with status {1}\n\nSTDOUT:\n{2}\n\nSTDERR:\n{3}".format(
+        message = "`{0}` exited with status {1}\n\n\nSTDERR:\n{2}".format(
             self.cmd,
             exit_code,
-            (stdout or b'').decode(),
             (stderr or b'').decode()
         )
 
