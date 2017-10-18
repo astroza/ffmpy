@@ -6,8 +6,48 @@ import re
 
 __version__ = '0.2.2'
 
+class FFtool(object):
+    def __init__(self, executable, global_options=None, inputs=None, outputs=None):
+        self.executable = executable
+        self._cmd = [executable]
 
-class FFmpeg(object):
+        global_options = global_options or []
+        if _is_sequence(global_options):
+            normalized_global_options = []
+            for opt in global_options:
+                normalized_global_options += shlex.split(opt)
+        else:
+            normalized_global_options = shlex.split(global_options)
+
+        self._cmd += normalized_global_options
+        self._cmd += _merge_args_opts(inputs, add_input_option=True)
+        self._cmd += _merge_args_opts(outputs)
+
+        self.cmd = subprocess.list2cmdline(self._cmd)
+        self.process = None
+
+    def __repr__(self):
+        return '<{0!r} {1!r}>'.format(self.__class__.__name__, self.cmd)
+
+    def start(self, input_data=None, stdin=None, stdout=None, stderr=None):
+        if input_data is not None or stdin is None:
+            stdin = subprocess.PIPE
+
+        try:
+            self.process = subprocess.Popen(
+                self._cmd,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr
+            )
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                raise FFExecutableNotFoundError(
+                    "Executable '{0}' not found".format(self.executable))
+            else:
+                raise
+
+class FFmpeg(FFtool):
     """Wrapper for various `FFmpeg <https://www.ffmpeg.org/>`_ related applications (ffmpeg,
     ffprobe).
     """
@@ -40,45 +80,8 @@ class FFmpeg(object):
             corresponding options (either as a list of strings or a single space separated string) as
             values
         """
-        self.executable = executable
-        self._cmd = [executable]
-
-        global_options = global_options or []
-        if _is_sequence(global_options):
-            normalized_global_options = []
-            for opt in global_options:
-                normalized_global_options += shlex.split(opt)
-        else:
-            normalized_global_options = shlex.split(global_options)
-
-        self._cmd += normalized_global_options
-        self._cmd += _merge_args_opts(inputs, add_input_option=True)
-        self._cmd += _merge_args_opts(outputs)
-
-        self.cmd = subprocess.list2cmdline(self._cmd)
-        self.process = None
+        super(FFmpeg, self).__init__(executable, global_options, inputs, outputs)
         self.update_size = update_size
-
-    def __repr__(self):
-        return '<{0!r} {1!r}>'.format(self.__class__.__name__, self.cmd)
-
-    def start(self, input_data=None, stdin=None, stdout=None):
-        if input_data is not None or stdin is None:
-            stdin = subprocess.PIPE
-
-        try:
-            self.process = subprocess.Popen(
-                self._cmd,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=subprocess.PIPE
-            )
-        except OSError as e:
-            if e.errno == errno.ENOENT:
-                raise FFExecutableNotFoundError(
-                    "Executable '{0}' not found".format(self.executable))
-            else:
-                raise
 
     def run(self, input_data=None, stdin=None, stdout=None, on_progress=None):
         """Execute FFmpeg command line.
@@ -107,7 +110,7 @@ class FFmpeg(object):
         :raise: `FFRuntimeError` in case FFmpeg command exits with a non-zero code;
             `FFExecutableNotFoundError` in case the executable path passed was not valid
         """
-        self.start(input_data, stdin, stdout)
+        self.start(input_data, stdin, stdout, subprocess.PIPE)
         return [None, self.wait(on_progress)]
 
     def wait(self, on_progress=None, stderr_ring_size=30):
@@ -177,7 +180,7 @@ class FFstate:
         return False
 
 
-class FFprobe(FFmpeg):
+class FFprobe(FFtool):
     """Wrapper for `ffprobe <https://www.ffmpeg.org/ffprobe.html>`_."""
 
     def __init__(self, executable='ffprobe', global_options='', inputs=None):
@@ -200,6 +203,12 @@ class FFprobe(FFmpeg):
             inputs=inputs
         )
 
+    def run(self, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
+        self.start(stdout=stdout, stderr=stderr)
+        out = self.process.communicate()
+        if self.process.returncode != 0:
+            raise FFRuntimeError(self.cmd, self.process.returncode, out[1])
+        return out
 
 class FFExecutableNotFoundError(Exception):
     """Raise when FFmpeg/FFprobe executable was not found."""
