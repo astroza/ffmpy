@@ -122,7 +122,7 @@ class FFmpeg(FFtool):
             latest_update = os.read(stderr_fileno, self.update_size)
             if ff_state.consume(latest_update) and on_progress is not None:
                 on_progress(ff_state)
-            stderr_ring.append(latest_update)
+            stderr_ring.append(latest_update.decode())
             if len(stderr_ring) > stderr_ring_size:
                 del stderr_ring[0]
             is_running = self.process.poll() is None
@@ -143,7 +143,7 @@ class FFstate:
 
     def consume(self, update):
         raw_update_dict = {}
-        for match in re.finditer(r"(?P<key>\S+)=\s*(?P<value>\S+)", update):
+        for match in re.finditer(r"(?P<key>\S+)=\s*(?P<value>\S+)", update.decode()):
             raw_update_dict[match.group("key")] = match.group("value")
         updated = self.update_frame(raw_update_dict.get("frame")) + \
             self.update_fps(raw_update_dict.get("fps")) + \
